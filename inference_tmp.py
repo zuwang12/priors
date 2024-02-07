@@ -7,6 +7,8 @@ import copy
 import scipy.spatial
 import cv2
 import sys
+from easydict import EasyDict
+import pickle
 
 from unet import UNetModel
 from TSPDataset import TSPDataset
@@ -15,6 +17,7 @@ from tsp_utils import TSP_2opt, rasterize_tsp
 
 import tqdm
 import matplotlib.pyplot as plt
+from ddim_with_logprob import ddim_step_with_logprob
 
 STEPS=256
 
@@ -81,7 +84,7 @@ class TSPDataset(torch.utils.data.Dataset):
             
         return img[np.newaxis,:,:], idx
 
-device = torch.device(f'cuda:1')
+device = torch.device(f'cuda:0')
 batch_size = 1
 img_size = 64
 
@@ -159,25 +162,204 @@ def runlat(model):
     scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=1, end_factor=0.1, total_iters=1000)
     diffusion = GaussianDiffusion(T=1000, schedule='linear')
     # model.latent.data=temp
+    diffusion.num_inference_steps = 50
+    diffusion.config = EasyDict(dict(
+        num_train_timesteps = 1000,
+        prediction_type = "epsilon",
+        thresholding = False,
+        clip_sample = False
+    ))
+                
+    config = EasyDict(dict(
+        adv_clip_max = 5,
+        eta = 1.0,
+        clip_range = 0.0001,
+        batch_size = 1,
+        num_inner_epochs = 1,
+        num_epochs = 100,
+        num_batches_per_epoch = 2
+    ))
+    
+    
+    first_epoch = 0
+    for epoch in range(first_epoch, config.num_epochs):
+        #################### SAMPLING ####################
+        pipeline.unet.eval()
+        samples = []
+        prompts = []
+        for i in tqdm(
+            range(config.num_batches_per_epoch), # range(2)
+            desc=f"Epoch {epoch}: sampling",
+            position=0,
+        ):
+            # generate prompts
+            prompts, prompt_metadata = zip(
+                *[
+                    prompt_fn(**config.prompt_fn_kwargs)
+                    for _ in range(config.sample.batch_size)
+                ]
+            )
 
-    steps = STEPS
-    for i in range(steps):
-        t = ((steps-i) + (steps-i)//3*math.cos(i/50))/steps*diffusion.T # Linearly decreasing + cosine
+            # encode prompts
+            prompt_ids = pipeline.tokenizer(
+                prompts, # ('starfish, sea star',)
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=pipeline.tokenizer.model_max_length,
+            ).input_ids.to(accelerator.device) # -> [1, 77]
+            prompt_embeds = pipeline.text_encoder(prompt_ids)[0] # [1, 77, 768]
 
-        t = np.clip(t, 1, diffusion.T)
-        t = np.array([t for _ in range(batch_size)]).astype(int)
+            # sample
+            with autocast():
+                images, _, latents, log_probs = pipeline_with_logprob(
+                    pipeline, # StableDiffusionPipeline
+                    prompt_embeds=prompt_embeds, # [1, 77, 768]
+                    negative_prompt_embeds=sample_neg_prompt_embeds, # [1, 77, 768] TODO: 이거가 uncond_embedding인가?
+                    num_inference_steps=config.sample.num_steps, # 50 | TODO: diffusion step 말하는 건가?
+                    guidance_scale=config.sample.guidance_scale, # 5.0
+                    eta=config.sample.eta, # 1.0
+                    output_type="pt",
+                ) #[1, 3, 512, 512], 51 x [1, 4, 64, 64], 50 TODO: 이거 Output인가?
 
-        # Denoise
-        xt, epsilon = diffusion.sample(model.encode(), t) # get x_{ti} in Algorithm1 - (3 ~ 4)
-        t = torch.from_numpy(t).float().view(batch_size)
-        epsilon_pred = diffusion_net(xt.float(), t.to(device))
+            latents = torch.stack(
+                latents, dim=1
+            )  # (batch_size, num_steps + 1, 4, 64, 64) ~ ([1, 51, 4, 64, 64])
+            log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1) ~ ([1, 50])
+            timesteps = pipeline.scheduler.timesteps.repeat(
+                config.sample.batch_size, 1
+            )  # (batch_size, num_steps) ~ ([1, 50])
 
-        loss = F.mse_loss(epsilon_pred, epsilon)
+            # compute rewards asynchronously
+            rewards = executor.submit(reward_fn, images, prompts, prompt_metadata) # , , ('starfish, sea star',), ({}, )
+            # yield to to make sure reward computation starts
+            time.sleep(0)
 
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-        scheduler.step()
+            samples.append(
+                {
+                    "prompt_ids": prompt_ids, # [1, 77]
+                    "prompt_embeds": prompt_embeds, # [1, 77, 768]
+                    "timesteps": timesteps, # [1, 50]
+                    "latents": latents[
+                        :, :-1
+                    ],  # each entry is the latent before timestep t -> ([1, 50, 4, 64, 64])
+                    "next_latents": latents[
+                        :, 1:
+                    ],  # each entry is the latent after timestep t -> ([1, 50, 4, 64, 64])
+                    "log_probs": log_probs, # [1, 50]
+                    "rewards": rewards,
+                }
+            )
+    
+        # wait for all rewards to be computed | TODO: Reward 계산방법 check
+        for sample in tqdm(
+            samples,
+            desc="Waiting for rewards",
+            position=0,
+        ):
+            rewards, reward_metadata = sample["rewards"].result() # -137.345, {} | TODO: 뭐하는 거..?
+            sample["rewards"] = torch.as_tensor(rewards, device=device)
+        
+        
+        # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
+        samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
+        rewards = samples["rewards"].cpu().numpy()
+        advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+                    
+        num_processes = 1
+        process_index = 0
+        samples["advantages"] = (
+            torch.as_tensor(advantages) # ([2])
+            .reshape(num_processes, -1)[process_index]
+            .to(device)
+        ) # tensor([ 1.0000, -1.0000])
+                    
+        total_batch_size, num_timesteps = samples["timesteps"].shape # (2, 50)
+        
+        for inner_epoch in range(config.num_inner_epochs): # in range(1)
+            # shuffle samples along batch dimension
+            perm = torch.randperm(total_batch_size, device=device) # torch.randperm(2)
+            samples = {k: v[perm] for k, v in samples.items()}
+
+            # shuffle along time dimension independently for each sample
+            perms = torch.stack(
+                [
+                    torch.randperm(num_timesteps, device=device)
+                    for _ in range(total_batch_size)
+                ]
+            ) # [2, 50]
+            for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+                samples[key] = samples[key][
+                    torch.arange(total_batch_size, device=device)[:, None],
+                    perms,
+                ]
+        
+            samples_batched = {
+                k: v.reshape(-1, config.batch_size, *v.shape[1:])
+                for k, v in samples.items()
+            }
+
+            # dict of lists -> list of dicts for easier iteration
+            samples_batched = [
+                dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
+            ]
+            
+            
+            for j, sample in tqdm(
+                list(enumerate(samples_batched)),
+                desc=f"Epoch {epoch}.{inner_epoch}: training",
+                position=0
+            ):
+            
+                steps = STEPS
+                for i in range(steps):
+                    t = ((steps-i) + (steps-i)//3*math.cos(i/50))/steps*diffusion.T # Linearly decreasing + cosine
+
+                    t = np.clip(t, 1, diffusion.T)
+                    t = np.array([t for _ in range(batch_size)]).astype(int)
+
+                    # Denoise
+                    xt, epsilon = diffusion.sample(model.encode(), t) # get x_{ti} in Algorithm1 - (3 ~ 4)
+                    t = torch.from_numpy(t).float().view(batch_size)
+                    epsilon_pred = diffusion_net(xt.float(), t.to(device))
+                    
+            ######################################### start #########################################################
+
+                    with open('./sample', 'rb') as fr: # TODO: Make sample | latents, next_latents, advantages, log_prob
+                        sample = pickle.load(fr)
+
+                    _, log_prob = ddim_step_with_logprob(
+                        diffusion, # config instance
+                        epsilon_pred, # model output | e_{\theta}^{(t)}(x_t)
+                        sample["timesteps"][:, i],
+                        sample["latents"][:, i], # x_t
+                        config.eta,
+                        prev_sample=sample["next_latents"][:, i],
+                    ) # get new policy value
+
+                    # ppo logic
+                    advantages = torch.clamp(
+                        sample["advantages"],
+                        -config.adv_clip_max,
+                        config.adv_clip_max,
+                    )
+                    ratio = torch.exp(log_prob - sample["log_probs"][:, i]) # new policy / old policy | prob은 policy를 의미, 곧 denosing process
+                    unclipped_loss = -advantages * ratio
+                    clipped_loss = -advantages * torch.clamp(
+                        ratio,
+                        1.0 - config.clip_range,
+                        1.0 + config.clip_range,
+                    )
+                    loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+                    
+            ######################################### complete #########################################################
+
+                    # loss = F.mse_loss(epsilon_pred, epsilon)
+
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+                    scheduler.step()
 
 nn = torch.nn
 costs = []

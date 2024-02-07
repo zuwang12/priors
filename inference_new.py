@@ -12,6 +12,7 @@ from unet import UNetModel
 from TSPDataset import TSPDataset
 from diffusion import GaussianDiffusion
 from tsp_utils import TSP_2opt, rasterize_tsp
+from ddim_with_logprob import ddim_step_with_logprob
 
 import tqdm
 import matplotlib.pyplot as plt
@@ -81,7 +82,7 @@ class TSPDataset(torch.utils.data.Dataset):
             
         return img[np.newaxis,:,:], idx
 
-device = torch.device(f'cuda:1')
+device = torch.device(f'cuda:0')
 batch_size = 1
 img_size = 64
 
@@ -161,23 +162,125 @@ def runlat(model):
     # model.latent.data=temp
 
     steps = STEPS
+    ########### TODO: Make sample ###########
+    
+    
+    
+    
+    
+    # ungather advantages; we only need to keep the entries corresponding to the samples on this process
+    samples["advantages"] = (
+        torch.as_tensor(advantages) # ([2])
+        .reshape(accelerator.num_processes, -1)[accelerator.process_index]
+        .to(accelerator.device)
+    ) # tensor([ 1.0000, -1.0000])
+
+    del samples["rewards"]
+    del samples["prompt_ids"]
+    
+    
+    # total_batch_size, num_timesteps = samples["timesteps"].shape # (2, 50)
+    # num_train_timesteps = 50
     for i in range(steps):
-        t = ((steps-i) + (steps-i)//3*math.cos(i/50))/steps*diffusion.T # Linearly decreasing + cosine
+        
+        # shuffle samples along batch dimension
+        perm = torch.randperm(total_batch_size, device=accelerator.device) # torch.randperm(2)
+        samples = {k: v[perm] for k, v in samples.items()}
 
-        t = np.clip(t, 1, diffusion.T)
-        t = np.array([t for _ in range(batch_size)]).astype(int)
+        # shuffle along time dimension independently for each sample
+        perms = torch.stack(
+            [
+                torch.randperm(num_timesteps, device=accelerator.device)
+                for _ in range(total_batch_size)
+            ]
+        ) # [2, 50]
+        for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+            samples[key] = samples[key][
+                torch.arange(total_batch_size, device=accelerator.device)[:, None],
+                perms,
+            ]
 
-        # Denoise
-        xt, epsilon = diffusion.sample(model.encode(), t) # get x_{ti} in Algorithm1 - (3 ~ 4)
-        t = torch.from_numpy(t).float().view(batch_size)
-        epsilon_pred = diffusion_net(xt.float(), t.to(device))
+        # rebatch for training : [2, 50, 4, 64, 64] -> [2, 1, 50, 4, 64, 64]
+        samples_batched = {
+            k: v.reshape(-1, config.train.batch_size, *v.shape[1:])
+            for k, v in samples.items()
+        }
 
-        loss = F.mse_loss(epsilon_pred, epsilon)
+        # dict of lists -> list of dicts for easier iteration
+        samples_batched = [
+            dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
+        ]
 
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-        scheduler.step()
+        for i, sample in list(enumerate(samples_batched)):
+            for j in range(num_train_timesteps):
+                t = ((steps-i) + (steps-i)//3*math.cos(i/50))/steps*diffusion.T # Linearly decreasing + cosine
+
+                t = np.clip(t, 1, diffusion.T)
+                t = np.array([t for _ in range(batch_size)]).astype(int)
+
+                # Denoise
+                xt, epsilon = diffusion.sample(model.encode(), t) # get x_{ti} in Algorithm1 - (3 ~ 4) | encoding : y(latent) -> f(y) (img) | sample : alg(4)
+                t = torch.from_numpy(t).float().view(batch_size)
+                epsilon_pred = diffusion_net(xt.float(), t.to(device))
+                
+                # loss = F.mse_loss(epsilon_pred, epsilon)
+                
+                ########## TODO: change code from diffusion object (mse) to rl denosing ##########
+                '''
+                1. make sample dictionary
+                2. get latent, timestep, advantage, logprob
+                3. compare shape, dtypes
+                '''
+                
+                from easydict import EasyDict
+                
+                import pickle
+                with open('./sample', 'rb') as fr: # TODO: Make sample | latents, next_latents, advantages, log_prob
+                    sample = pickle.load(fr)
+                
+                diffusion.num_inference_steps = 50
+                diffusion.config = EasyDict(dict(
+                    num_train_timesteps = 1000,
+                    prediction_type = "epsilon",
+                    thresholding = False,
+                    clip_sample = False
+                ))
+                
+                config = EasyDict(dict(
+                    adv_clip_max = 5,
+                    eta = 1.0,
+                    clip_range = 0.0001
+                ))
+                _, log_prob = ddim_step_with_logprob(
+                    diffusion, # config instance
+                    epsilon_pred, # model output | e_{\theta}^{(t)}(x_t)
+                    sample["timesteps"][:, j],
+                    sample["latents"][:, j], # x_t
+                    config.sample.eta,
+                    prev_sample=sample["next_latents"][:, j],
+                ) # get new policy value
+
+                # ppo logic
+                advantages = torch.clamp(
+                    sample["advantages"],
+                    -config.adv_clip_max,
+                    config.adv_clip_max,
+                )
+                ratio = torch.exp(log_prob - sample["log_probs"][:, j]) # new policy / old policy | prob은 policy를 의미, 곧 denosing process
+                unclipped_loss = -advantages * ratio
+                clipped_loss = -advantages * torch.clamp(
+                    ratio,
+                    1.0 - config.clip_range,
+                    1.0 + config.clip_range,
+                )
+                loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+
+                ########## modification complete ##########
+
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                scheduler.step()
 
 nn = torch.nn
 costs = []
