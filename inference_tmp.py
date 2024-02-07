@@ -192,35 +192,16 @@ def runlat(model):
             desc=f"Epoch {epoch}: sampling",
             position=0,
         ):
-            # generate prompts
-            prompts, prompt_metadata = zip(
-                *[
-                    prompt_fn(**config.prompt_fn_kwargs)
-                    for _ in range(config.sample.batch_size)
-                ]
-            )
-
-            # encode prompts
-            prompt_ids = pipeline.tokenizer(
-                prompts, # ('starfish, sea star',)
-                return_tensors="pt",
-                padding="max_length",
-                truncation=True,
-                max_length=pipeline.tokenizer.model_max_length,
-            ).input_ids.to(accelerator.device) # -> [1, 77]
-            prompt_embeds = pipeline.text_encoder(prompt_ids)[0] # [1, 77, 768]
-
             # sample
-            with autocast():
-                images, _, latents, log_probs = pipeline_with_logprob(
-                    pipeline, # StableDiffusionPipeline
-                    prompt_embeds=prompt_embeds, # [1, 77, 768]
-                    negative_prompt_embeds=sample_neg_prompt_embeds, # [1, 77, 768] TODO: 이거가 uncond_embedding인가?
-                    num_inference_steps=config.sample.num_steps, # 50 | TODO: diffusion step 말하는 건가?
-                    guidance_scale=config.sample.guidance_scale, # 5.0
-                    eta=config.sample.eta, # 1.0
-                    output_type="pt",
-                ) #[1, 3, 512, 512], 51 x [1, 4, 64, 64], 50 TODO: 이거 Output인가?
+            images, _, latents, log_probs = pipeline_with_logprob(
+                pipeline, # StableDiffusionPipeline
+                prompt_embeds=prompt_embeds, # [1, 77, 768]
+                negative_prompt_embeds=sample_neg_prompt_embeds, # [1, 77, 768] TODO: 이거가 uncond_embedding인가?
+                num_inference_steps=config.sample.num_steps, # 50 | TODO: diffusion step 말하는 건가?
+                guidance_scale=config.sample.guidance_scale, # 5.0
+                eta=config.sample.eta, # 1.0
+                output_type="pt",
+            ) #[1, 3, 512, 512], 51 x [1, 4, 64, 64], 50 TODO: 이거 Output인가?
 
             latents = torch.stack(
                 latents, dim=1
