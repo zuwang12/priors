@@ -4,8 +4,6 @@ import os
 import datetime
 from concurrent import futures
 import time
-from absl import app, flags
-from ml_collections import config_flags
 import ml_collections
 from accelerate import Accelerator
 from accelerate.utils import set_seed, ProjectConfiguration
@@ -17,12 +15,9 @@ import numpy as np
 import ddpo_pytorch.prompts
 import ddpo_pytorch.rewards
 from ddpo_pytorch.stat_tracking import PerPromptStatTracker
-from ddpo_pytorch.diffusers_patch.pipeline_with_logprob_ddpm import pipeline_with_logprob_ddpm
 from ddpo_pytorch.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob
 from ddpo_pytorch.diffusers_patch.ddim_with_logprob import ddim_step_with_logprob
-from ddpo_pytorch.diffusers_patch.ddpm_with_logprob import ddpm_step_with_logprob
 import torch
-import wandb
 from functools import partial
 import tqdm
 import tempfile
@@ -138,7 +133,6 @@ config.per_prompt_stat_tracking.buffer_size = 16
 # contains fewer than `min_count` values, the mean and std of the entire batch will be used instead.
 config.per_prompt_stat_tracking.min_count = 16
 
-logger = get_logger(__name__)
 torch.cuda.set_device(2)
 
 unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
@@ -186,8 +180,6 @@ accelerator = Accelerator(
 #         config=config.to_dict(),
 #         init_kwargs={"wandb": {"name": config.run_name}},
 #     )
-
-logger.info(f"\n{config}")
 
 # set seed (device_specific is very important to get different prompts on different devices)
 set_seed(config.seed, device_specific=True)
@@ -377,29 +369,11 @@ total_train_batch_size = (
     * config.train.gradient_accumulation_steps
 )
 
-logger.info("***** Running training *****")
-logger.info(f"  Num Epochs = {config.num_epochs}")
-logger.info(f"  Sample batch size per device = {config.sample.batch_size}")
-logger.info(f"  Train batch size per device = {config.train.batch_size}")
-logger.info(
-    f"  Gradient Accumulation steps = {config.train.gradient_accumulation_steps}"
-)
-logger.info("")
-logger.info(f"  Total number of samples per epoch = {samples_per_epoch}")
-logger.info(
-    f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}"
-)
-logger.info(
-    f"  Number of gradient updates per inner epoch = {samples_per_epoch // total_train_batch_size}"
-)
-logger.info(f"  Number of inner epochs = {config.train.num_inner_epochs}")
-
 assert config.sample.batch_size >= config.train.batch_size
 assert config.sample.batch_size % config.train.batch_size == 0
 assert samples_per_epoch % total_train_batch_size == 0
 
 if config.resume_from:
-    logger.info(f"Resuming from {config.resume_from}")
     accelerator.load_state(config.resume_from)
     first_epoch = int(config.resume_from.split("_")[-1]) + 1
 else:
