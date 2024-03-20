@@ -7,18 +7,28 @@ import copy
 import scipy.spatial
 import cv2
 import sys
+from PIL import Image
+import pandas as pd
 
 from unet import UNetModel
 from TSPDataset import TSPDataset
 from diffusion import GaussianDiffusion
 from tsp_utils import TSP_2opt, rasterize_tsp
-from ddim_with_logprob import ddim_step_with_logprob
 
 import tqdm
 import matplotlib.pyplot as plt
 
-STEPS=256
+seed = 2024
+deterministic = True
 
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+if deterministic:
+	torch.backends.cudnn.deterministic = True
+	torch.backends.cudnn.benchmark = False
+ 
+ 
 class TSPDataset(torch.utils.data.Dataset):
     def __init__(self, data_file, img_size, point_radius=1, point_color=1, point_circle=True, line_thickness=2, line_color=0.5, max_points=100):
         self.data_file = data_file
@@ -50,7 +60,7 @@ class TSPDataset(torch.utils.data.Dataset):
         tour = line.split(' output ')[1]
         tour = tour.split(' ')
         tour = np.array([int(t) for t in tour])
-        
+
         # Rasterize lines
         img = np.zeros((self.img_size, self.img_size))
         for i in range(tour.shape[0]-1):
@@ -58,51 +68,57 @@ class TSPDataset(torch.utils.data.Dataset):
             to_idx = tour[i+1]-1
 
             cv2.line(img, 
-                     tuple(((img_size-1)*points[from_idx,::-1]).astype(int)), 
-                     tuple(((img_size-1)*points[to_idx,::-1]).astype(int)), 
+                     tuple(((self.img_size-1)*points[from_idx,::-1]).astype(int)), 
+                     tuple(((self.img_size-1)*points[to_idx,::-1]).astype(int)), 
                      color=self.line_color, thickness=self.line_thickness)
 
         # Rasterize points
         for i in range(points.shape[0]):
             if self.point_circle:
-                cv2.circle(img, tuple(((img_size-1)*points[i,::-1]).astype(int)), 
+                cv2.circle(img, tuple(((self.img_size-1)*points[i,::-1]).astype(int)), 
                            radius=self.point_radius, color=self.point_color, thickness=-1)
             else:
-                row = round((img_size-1)*points[i,0])
-                col = round((img_size-1)*points[i,1])
+                row = round((self.img_size-1)*points[i,0])
+                col = round((self.img_size-1)*points[i,1])
                 img[row,col] = self.point_color
             
         # Rescale image to [-1,1]
         img = 2*(img-0.5)
             
         return img, points, tour
+    
+    def draw_tour(self, tour, points):
+        img = np.zeros((self.img_size, self.img_size))
+        for i in range(tour.shape[0]-1):
+            from_idx = tour[i]-1
+            to_idx = tour[i+1]-1
+
+            cv2.line(img, 
+                        tuple(((self.img_size-1)*points[from_idx,::-1]).astype(int)), 
+                        tuple(((self.img_size-1)*points[to_idx,::-1]).astype(int)), 
+                        color=self.line_color, thickness=self.line_thickness)
+
+        # Rasterize points
+        for i in range(points.shape[0]):
+            if self.point_circle:
+                cv2.circle(img, tuple(((self.img_size-1)*points[i,::-1]).astype(int)), 
+                            radius=self.point_radius, color=self.point_color, thickness=-1)
+            else:
+                row = round((self.img_size-1)*points[i,0])
+                col = round((self.img_size-1)*points[i,1])
+                img[row,col] = self.point_color
+            
+        # Rescale image to [-1,1]
+        img = 2*(img-0.5)
+        return img
+            
 
     def __getitem__(self, idx):
         img, points, tour = self.rasterize(idx)
             
         return img[np.newaxis,:,:], idx
-
-device = torch.device(f'cuda:0')
-batch_size = 1
-img_size = 64
-
-test_dataset = TSPDataset(data_file=f'data/tsp50_test_concorde.txt',
-                          img_size=img_size,
-                          point_radius=2, point_color=1, point_circle=True,
-                          line_thickness=2, line_color=0.5)
-test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
-print('Created dataset')
-
-
-diffusion_net = UNetModel(image_size=img_size, in_channels=1, out_channels=1, 
-                          model_channels=64, num_res_blocks=2, channel_mult=(1,2,3,4),
-                          attention_resolutions=[16,8], num_heads=4).to(device)
-
-diffusion_net.load_state_dict(torch.load(f'models/unet50_64_8.pth'))
-diffusion_net.to(device)
-diffusion_net.train()
-print('Loaded model')
-                                         
+    
+    
 def normalize(cost, entropy_reg=0.1, n_iters=20, eps=1e-6):
     # Cost matrix is exp(-lambda*C)
     cost_matrix = -entropy_reg * cost # 0.1 * [1, 50, 50] (latent)
@@ -153,7 +169,6 @@ class InferenceModel(nn.Module):
         img[img_query.tile(batch_size,1,1,1) == 1] = 1
         
         return img
-    
 
 def runlat(model):
     opt = torch.optim.Adam(model.parameters(), lr=1, betas=(0, 0.9))
@@ -162,135 +177,68 @@ def runlat(model):
     # model.latent.data=temp
 
     steps = STEPS
-    ########### TODO: Make sample ###########
-    
-    
-    
-    
-    
-    # ungather advantages; we only need to keep the entries corresponding to the samples on this process
-    samples["advantages"] = (
-        torch.as_tensor(advantages) # ([2])
-        .reshape(accelerator.num_processes, -1)[accelerator.process_index]
-        .to(accelerator.device)
-    ) # tensor([ 1.0000, -1.0000])
-
-    del samples["rewards"]
-    del samples["prompt_ids"]
-    
-    
-    # total_batch_size, num_timesteps = samples["timesteps"].shape # (2, 50)
-    # num_train_timesteps = 50
     for i in range(steps):
+        t = ((steps-i) + (steps-i)//3*math.cos(i/50))/steps*diffusion.T # Linearly decreasing + cosine
+
+        t = np.clip(t, 1, diffusion.T)
+        t = np.array([t for _ in range(batch_size)]).astype(int)
+
+        # Denoise
+        xt, epsilon = diffusion.sample(model.encode(), t) # get x_{ti} in Algorithm1 - (3 ~ 4)
+        t = torch.from_numpy(t).float().view(batch_size)
+        epsilon_pred = diffusion_net(xt.float(), t.to(device))
+
+        loss = F.mse_loss(epsilon_pred, epsilon)
+
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        scheduler.step()
         
-        # shuffle samples along batch dimension
-        perm = torch.randperm(total_batch_size, device=accelerator.device) # torch.randperm(2)
-        samples = {k: v[perm] for k, v in samples.items()}
+        
+STEPS=256
 
-        # shuffle along time dimension independently for each sample
-        perms = torch.stack(
-            [
-                torch.randperm(num_timesteps, device=accelerator.device)
-                for _ in range(total_batch_size)
-            ]
-        ) # [2, 50]
-        for key in ["timesteps", "latents", "next_latents", "log_probs"]:
-            samples[key] = samples[key][
-                torch.arange(total_batch_size, device=accelerator.device)[:, None],
-                perms,
-            ]
+device = torch.device(f'cuda:1')
+batch_size = 1
+img_size = 64
 
-        # rebatch for training : [2, 50, 4, 64, 64] -> [2, 1, 50, 4, 64, 64]
-        samples_batched = {
-            k: v.reshape(-1, config.train.batch_size, *v.shape[1:])
-            for k, v in samples.items()
-        }
+test_dataset = TSPDataset(data_file=f'data/tsp50_test_concorde.txt',
+                          img_size=img_size,
+                          point_radius=2, point_color=1, point_circle=True,
+                          line_thickness=2, line_color=0.5)
+test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+print('Created dataset')
 
-        # dict of lists -> list of dicts for easier iteration
-        samples_batched = [
-            dict(zip(samples_batched, x)) for x in zip(*samples_batched.values())
-        ]
 
-        for i, sample in list(enumerate(samples_batched)):
-            for j in range(num_train_timesteps):
-                t = ((steps-i) + (steps-i)//3*math.cos(i/50))/steps*diffusion.T # Linearly decreasing + cosine
+diffusion_net = UNetModel(image_size=img_size, in_channels=1, out_channels=1, 
+                          model_channels=64, num_res_blocks=2, channel_mult=(1,2,3,4),
+                          attention_resolutions=[16,8], num_heads=4).to(device)
 
-                t = np.clip(t, 1, diffusion.T)
-                t = np.array([t for _ in range(batch_size)]).astype(int)
+diffusion_net.load_state_dict(torch.load(f'models/unet50_64_8.pth'))
+diffusion_net.to(device)
+diffusion_net.train()
+print('Loaded model')
 
-                # Denoise
-                xt, epsilon = diffusion.sample(model.encode(), t) # get x_{ti} in Algorithm1 - (3 ~ 4) | encoding : y(latent) -> f(y) (img) | sample : alg(4)
-                t = torch.from_numpy(t).float().view(batch_size)
-                epsilon_pred = diffusion_net(xt.float(), t.to(device))
-                
-                # loss = F.mse_loss(epsilon_pred, epsilon)
-                
-                ########## TODO: change code from diffusion object (mse) to rl denosing ##########
-                '''
-                1. make sample dictionary
-                2. get latent, timestep, advantage, logprob
-                3. compare shape, dtypes
-                '''
-                
-                from easydict import EasyDict
-                
-                import pickle
-                with open('./sample', 'rb') as fr: # TODO: Make sample | latents, next_latents, advantages, log_prob
-                    sample = pickle.load(fr)
-                
-                diffusion.num_inference_steps = 50
-                diffusion.config = EasyDict(dict(
-                    num_train_timesteps = 1000,
-                    prediction_type = "epsilon",
-                    thresholding = False,
-                    clip_sample = False
-                ))
-                
-                config = EasyDict(dict(
-                    adv_clip_max = 5,
-                    eta = 1.0,
-                    clip_range = 0.0001
-                ))
-                _, log_prob = ddim_step_with_logprob(
-                    diffusion, # config instance
-                    epsilon_pred, # model output | e_{\theta}^{(t)}(x_t)
-                    sample["timesteps"][:, j],
-                    sample["latents"][:, j], # x_t
-                    config.sample.eta,
-                    prev_sample=sample["next_latents"][:, j],
-                ) # get new policy value
 
-                # ppo logic
-                advantages = torch.clamp(
-                    sample["advantages"],
-                    -config.adv_clip_max,
-                    config.adv_clip_max,
-                )
-                ratio = torch.exp(log_prob - sample["log_probs"][:, j]) # new policy / old policy | prob은 policy를 의미, 곧 denosing process
-                unclipped_loss = -advantages * ratio
-                clipped_loss = -advantages * torch.clamp(
-                    ratio,
-                    1.0 - config.clip_range,
-                    1.0 + config.clip_range,
-                )
-                loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-
-                ########## modification complete ##########
-
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-                scheduler.step()
 
 nn = torch.nn
-costs = []
+results = []
 nnn = 0
-for batch in test_dataloader:
+for batch in tqdm.tqdm(test_dataloader):
     nnn += 1
     img, sample_idx = batch # [-1, 0, 1]로 이뤄진 GT image
 
     _, points, gt_tour = test_dataset.rasterize(sample_idx[0].item())
-
+    
+    ########################## GT ##########################
+    # plt.imshow(img[0,0].cpu().numpy(), cmap='gray')
+    # plt.show()
+    
+    pil = Image.fromarray(((img[0,0].cpu().numpy()+1) * 127).astype(np.uint8), 'L')
+    pil = pil.resize((256, 256))
+    pil.save(f'./Result/Image/GT_{nnn}.png')
+    ########################## GT ##########################
+    
     img_query = torch.zeros_like(img)
 
     img_query[img == 1] = 1
@@ -299,7 +247,16 @@ for batch in test_dataloader:
     
     model = InferenceModel().to(device)
     runlat(model)
- 
+    
+    ########################## Encoding ##########################
+    # plt.imshow(model.encode()[0,0].detach().cpu().numpy(), cmap='gray')
+    # plt.show()
+    
+    pil = Image.fromarray(((model.encode()[0,0].detach().cpu().numpy()+1) * 127).astype(np.uint8), 'L')
+    pil = pil.resize((256, 256))
+    pil.save(f'./Result/Image/encoding_{nnn}.png')
+    ########################## Encoding ##########################
+    
     adj_mat = normalize((model.latent)).detach().cpu().numpy()[batch_idx] # model.latent : [1, 50, 50] -> adj_mat : (50, 50)
     adj_mat = adj_mat+adj_mat.T
 
@@ -311,6 +268,7 @@ for batch in test_dataloader:
     components = np.zeros((adj_mat.shape[0],2)).astype(int) # (50, 2)
     components[:] = np.arange(adj_mat.shape[0])[...,None] # (50, 1) | [[1], [2], ... , [49]]
     real_adj_mat = np.zeros_like(adj_mat) # (50, 50) 
+    np.seterr(divide='ignore', invalid='ignore') 
     for edge in (-adj_mat/dists).flatten().argsort(): # [1715,  784, 1335, ..., 1326, 1224, 2499]) | 실제 거리(dists) 대비 adj_mat값이 가장 높은 순으로 iter
         a,b = edge//adj_mat.shape[0],edge%adj_mat.shape[0] # (34, 15)
         if not (a in components and b in components): continue
@@ -337,7 +295,7 @@ for batch in test_dataloader:
     # Refine using 2-opt
     tsp_solver = TSP_2opt(points)
     solved_tour, ns = tsp_solver.solve_2opt(tour)
-
+    
     def has_duplicates(l):
         existing = []
         for item in l:
@@ -348,13 +306,31 @@ for batch in test_dataloader:
 
     assert solved_tour[-1] == solved_tour[0], 'Tour not a cycle'
     assert not has_duplicates(solved_tour[:-1]), 'Tour not Hamiltonian'
-
+    
+    img_pred = test_dataset.draw_tour(np.array(solved_tour)+1, points)
     gt_cost = tsp_solver.evaluate([i-1 for i in gt_tour])
     solved_cost = tsp_solver.evaluate(solved_tour)
-    print(f'Ground truth cost: {gt_cost:.3f}')
-    print(f'Predicted cost: {solved_cost:.3f} (Gap: {100*(solved_cost-gt_cost) / gt_cost:.4f}%)')
-    costs.append((solved_cost, gt_cost, ns))
-    if nnn % 1 == 0: 
-        print((solved_cost-gt_cost)/gt_cost, sum(y[0] for y in costs)/sum(y[1] for y in costs)-1, ns)
-print(costs)
-print(sum(y[0] for y in costs), sum(y[1] for y in costs), sum(y[2] for y in costs)/len(costs))
+    gap = 100*(solved_cost-gt_cost) / gt_cost
+    # print(f'Ground truth cost: {gt_cost:.3f}')
+    # print(f'Predicted cost: {solved_cost:.3f} (Gap: {100*(solved_cost-gt_cost) / gt_cost:.4f}%)')
+    
+    ########################## Prediction ##########################
+    # plt.imshow(img_pred, cmap='gray')
+    # plt.show()
+    
+    pil = Image.fromarray(((img_pred+1) * 127).astype(np.uint8), 'L')
+    pil = pil.resize((256, 256))
+    pil.save(f'./Result/Image/Img_pred_{nnn}_{gap:.4f}.png')
+    ########################## Prediction ##########################
+    
+    results.append((solved_cost, gt_cost, gap, ns, points, gt_tour, solved_tour))
+    
+result_df = pd.DataFrame({
+    'solved_cost' : [x[0] for x in results],
+    'gt_cost' : [x[1] for x in results],
+    'gap(%)' : [x[2] for x in results],
+    'ns' : [x[3] for x in results],
+    'gt_tour' : [x[5] for x in results],
+    'solved_tour' : [x[6] for x in results],
+})
+result_df.to_csv('./Result/result.csv', index=False)

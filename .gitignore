@@ -1,8 +1,20 @@
+.vscode/
+
 ## directory
 __pycache__/
 data/
 models/
+sample/
+images/
+
 
 ## files
 *.pyc
 *.gz
+*.npy
+*.png
+*.ipynb
+*.csv
+
+
+
