@@ -6,7 +6,8 @@ data/
 models/
 sample/
 images/
-
+logs/
+test/
 
 ## files
 *.pyc

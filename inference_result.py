@@ -9,15 +9,46 @@ import cv2
 import sys
 from PIL import Image
 import pandas as pd
+import os
 
 from unet import UNetModel
-from TSPDataset import TSPDataset
+# from TSPDataset import TSPDataset
+from model.TSPModel import TSPDataset
 from diffusion import GaussianDiffusion
 from tsp_utils import TSP_2opt, rasterize_tsp
 
 import tqdm
 import matplotlib.pyplot as plt
+import reward_fns
+from utils import calculate_distance_matrix2
+import argparse
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--save_freq", type=int, default=2)
+parser.add_argument("--num_cities", type=int, default=20)
+parser.add_argument("--constraint_type", type=str, default='path')
+parser.add_argument("--run_name", type=str, default='tsp_plug_and_play')
+parser.add_argument("--start_idx", type=int, default=0)
+parser.add_argument("--end_idx", type=int, default=1280)
+args = parser.parse_args()
+
+date_per_type = {
+    'box' : '240710',
+    'path' : '240711',
+    'cluster' : '240721', 
+}
+
+print(args)
+
+save_freq = 2
+batch_size = 1
+img_size = 64
+constraint_type = args.constraint_type
+reward_type = 'tsp_constraint'
+reward_fn = getattr(reward_fns, reward_type)()
+FILE_NAME = F'tsp{args.num_cities}_{args.constraint_type}_constraint_{date_per_type[args.constraint_type]}.txt'
+
+device = torch.device(f'cuda' if torch.cuda.is_available() else 'cpu')
 seed = 2024
 deterministic = True
 
@@ -28,97 +59,7 @@ if deterministic:
 	torch.backends.cudnn.deterministic = True
 	torch.backends.cudnn.benchmark = False
  
- 
-class TSPDataset(torch.utils.data.Dataset):
-    def __init__(self, data_file, img_size, point_radius=1, point_color=1, point_circle=True, line_thickness=2, line_color=0.5, max_points=100):
-        self.data_file = data_file
-        self.img_size = img_size
-        self.point_radius = point_radius
-        self.point_color = point_color
-        self.point_circle = point_circle
-        self.line_thickness = line_thickness
-        self.line_color = line_color
-        self.max_points = max_points
-        
-        self.file_lines = open(data_file).read().splitlines()
-        print(f'Loaded "{data_file}" with {len(self.file_lines)} lines')
-        
-    def __len__(self):
-        return len(self.file_lines)
-    
-    def rasterize(self, idx):
-        # Select sample
-        line = self.file_lines[idx]
-        # Clear leading/trailing characters
-        line = line.strip()
 
-        # Extract points
-        points = line.split(' output ')[0]
-        points = points.split(' ')
-        points = np.array([[float(points[i]), float(points[i+1])] for i in range(0,len(points),2)])
-        # Extract tour
-        tour = line.split(' output ')[1]
-        tour = tour.split(' ')
-        tour = np.array([int(t) for t in tour])
-
-        # Rasterize lines
-        img = np.zeros((self.img_size, self.img_size))
-        for i in range(tour.shape[0]-1):
-            from_idx = tour[i]-1
-            to_idx = tour[i+1]-1
-
-            cv2.line(img, 
-                     tuple(((self.img_size-1)*points[from_idx,::-1]).astype(int)), 
-                     tuple(((self.img_size-1)*points[to_idx,::-1]).astype(int)), 
-                     color=self.line_color, thickness=self.line_thickness)
-
-        # Rasterize points
-        for i in range(points.shape[0]):
-            if self.point_circle:
-                cv2.circle(img, tuple(((self.img_size-1)*points[i,::-1]).astype(int)), 
-                           radius=self.point_radius, color=self.point_color, thickness=-1)
-            else:
-                row = round((self.img_size-1)*points[i,0])
-                col = round((self.img_size-1)*points[i,1])
-                img[row,col] = self.point_color
-            
-        # Rescale image to [-1,1]
-        img = 2*(img-0.5)
-            
-        return img, points, tour
-    
-    def draw_tour(self, tour, points):
-        img = np.zeros((self.img_size, self.img_size))
-        for i in range(tour.shape[0]-1):
-            from_idx = tour[i]-1
-            to_idx = tour[i+1]-1
-
-            cv2.line(img, 
-                        tuple(((self.img_size-1)*points[from_idx,::-1]).astype(int)), 
-                        tuple(((self.img_size-1)*points[to_idx,::-1]).astype(int)), 
-                        color=self.line_color, thickness=self.line_thickness)
-
-        # Rasterize points
-        for i in range(points.shape[0]):
-            if self.point_circle:
-                cv2.circle(img, tuple(((self.img_size-1)*points[i,::-1]).astype(int)), 
-                            radius=self.point_radius, color=self.point_color, thickness=-1)
-            else:
-                row = round((self.img_size-1)*points[i,0])
-                col = round((self.img_size-1)*points[i,1])
-                img[row,col] = self.point_color
-            
-        # Rescale image to [-1,1]
-        img = 2*(img-0.5)
-        return img
-            
-
-    def __getitem__(self, idx):
-        img, points, tour = self.rasterize(idx)
-            
-        return img[np.newaxis,:,:], idx
-    
-    
 def normalize(cost, entropy_reg=0.1, n_iters=20, eps=1e-6):
     # Cost matrix is exp(-lambda*C)
     cost_matrix = -entropy_reg * cost # 0.1 * [1, 50, 50] (latent)
@@ -198,14 +139,20 @@ def runlat(model):
         
 STEPS=256
 
-device = torch.device(f'cuda:1')
-batch_size = 1
-img_size = 64
+root_path = '/mnt/home/zuwang/workspace/diffusion_rl_tsp'
+data_path = os.path.join(root_path, 'data')
+input_path = os.path.join(data_path, FILE_NAME)
+output_path = os.path.join(root_path, f'Results/{args.constraint_type}/{args.run_name}')
+os.makedirs(output_path, exist_ok=True)
 
-test_dataset = TSPDataset(data_file=f'data/tsp50_test_concorde.txt',
+print('input_path : ', input_path)
+print('output_path : ', output_path)
+
+test_dataset = TSPDataset(data_file=input_path,
                           img_size=img_size,
                           point_radius=2, point_color=1, point_circle=True,
-                          line_thickness=2, line_color=0.5)
+                          line_thickness=2, line_color=0.5,
+                          constraint_type = args.constraint_type)
 test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 print('Created dataset')
 
@@ -214,31 +161,30 @@ diffusion_net = UNetModel(image_size=img_size, in_channels=1, out_channels=1,
                           model_channels=64, num_res_blocks=2, channel_mult=(1,2,3,4),
                           attention_resolutions=[16,8], num_heads=4).to(device)
 
-diffusion_net.load_state_dict(torch.load(f'models/unet50_64_8.pth'))
+diffusion_net.load_state_dict(torch.load(f'models/unet50_64_8.pth', map_location=device))
 diffusion_net.to(device)
 diffusion_net.train()
 print('Loaded model')
 
 
-
 nn = torch.nn
 results = []
 nnn = 0
+
+sample_idxes, basic_costs, gt_costs, penalty_counts = [], [], [], []
+
 for batch in tqdm.tqdm(test_dataloader):
     nnn += 1
-    img, sample_idx = batch # [-1, 0, 1]로 이뤄진 GT image
+    img, _, _, sample_idx, _ = batch # [-1, 0, 1]로 이뤄진 GT image
+    if not (args.start_idx <= int(sample_idx) < args.end_idx):
+        continue
+    _, points, gt_tour, constraint = test_dataset.rasterize(sample_idx[0].item())
+    if args.constraint_type == 'box':
+        distance_matrix, intersection_matrix = calculate_distance_matrix2(points, constraint)
+        constraint=intersection_matrix
+    tsp_solver = TSP_2opt(points)
+    gt_cost = tsp_solver.evaluate([x-1 for x in gt_tour])
 
-    _, points, gt_tour = test_dataset.rasterize(sample_idx[0].item())
-    
-    ########################## GT ##########################
-    # plt.imshow(img[0,0].cpu().numpy(), cmap='gray')
-    # plt.show()
-    
-    pil = Image.fromarray(((img[0,0].cpu().numpy()+1) * 127).astype(np.uint8), 'L')
-    pil = pil.resize((256, 256))
-    pil.save(f'./Result/Image/GT_{nnn}.png')
-    ########################## GT ##########################
-    
     img_query = torch.zeros_like(img)
 
     img_query[img == 1] = 1
@@ -247,16 +193,7 @@ for batch in tqdm.tqdm(test_dataloader):
     
     model = InferenceModel().to(device)
     runlat(model)
-    
-    ########################## Encoding ##########################
-    # plt.imshow(model.encode()[0,0].detach().cpu().numpy(), cmap='gray')
-    # plt.show()
-    
-    pil = Image.fromarray(((model.encode()[0,0].detach().cpu().numpy()+1) * 127).astype(np.uint8), 'L')
-    pil = pil.resize((256, 256))
-    pil.save(f'./Result/Image/encoding_{nnn}.png')
-    ########################## Encoding ##########################
-    
+
     adj_mat = normalize((model.latent)).detach().cpu().numpy()[batch_idx] # model.latent : [1, 50, 50] -> adj_mat : (50, 50)
     adj_mat = adj_mat+adj_mat.T
 
@@ -264,73 +201,30 @@ for batch in tqdm.tqdm(test_dataloader):
     for i in range(dists.shape[0]):
         for j in range(dists.shape[0]):
             dists[i,j] = np.linalg.norm(points[i]-points[j])
+            
+    output = reward_fn(points, model.latent, dists, args.constraint_type, constraint = constraint)[1]
+       
+    basic_cost = output['basic_cost']
+    penalty_count = output['penalty_count']
     
-    components = np.zeros((adj_mat.shape[0],2)).astype(int) # (50, 2)
-    components[:] = np.arange(adj_mat.shape[0])[...,None] # (50, 1) | [[1], [2], ... , [49]]
-    real_adj_mat = np.zeros_like(adj_mat) # (50, 50) 
-    np.seterr(divide='ignore', invalid='ignore') 
-    for edge in (-adj_mat/dists).flatten().argsort(): # [1715,  784, 1335, ..., 1326, 1224, 2499]) | 실제 거리(dists) 대비 adj_mat값이 가장 높은 순으로 iter
-        a,b = edge//adj_mat.shape[0],edge%adj_mat.shape[0] # (34, 15)
-        if not (a in components and b in components): continue
-        ca = np.nonzero((components==a).sum(1))[0][0] # 34
-        cb = np.nonzero((components==b).sum(1))[0][0] # 15
-        if ca==cb: continue
-        cca = sorted(components[ca],key=lambda x:x==a) # [34, 34]
-        ccb = sorted(components[cb],key=lambda x:x==b) # [15, 15]
-        newc = np.array([[cca[0],ccb[0]]]) # [34, 15]
-        m,M = min(ca,cb),max(ca,cb) # (15, 34)
-        real_adj_mat[a,b] = 1 # 연결됨
-        components = np.concatenate([components[:m],components[m+1:M],components[M+1:],newc],0) # (49, 2)
-        if len(components)==1: break
-    real_adj_mat[components[0,1],components[0,0]] = 1 # 마지막 연결
-    real_adj_mat += real_adj_mat.T # make symmetric matrix
+    sample_idxes.append(int(sample_idx))
+    basic_costs.append(float(basic_cost))
+    penalty_counts.append(int(penalty_count))
+    gt_costs.append(float(gt_cost))
     
-    tour = [0]
-    while len(tour)<adj_mat.shape[0]+1:
-        n = np.nonzero(real_adj_mat[tour[-1]])[0]
-        if len(tour)>1:
-            n = n[n!=tour[-2]]
-        tour.append(n.max())
-
-    # Refine using 2-opt
-    tsp_solver = TSP_2opt(points)
-    solved_tour, ns = tsp_solver.solve_2opt(tour)
-    
-    def has_duplicates(l):
-        existing = []
-        for item in l:
-            if item in existing:
-                return True
-            existing.append(item)
-        return False
-
-    assert solved_tour[-1] == solved_tour[0], 'Tour not a cycle'
-    assert not has_duplicates(solved_tour[:-1]), 'Tour not Hamiltonian'
-    
-    img_pred = test_dataset.draw_tour(np.array(solved_tour)+1, points)
-    gt_cost = tsp_solver.evaluate([i-1 for i in gt_tour])
-    solved_cost = tsp_solver.evaluate(solved_tour)
-    gap = 100*(solved_cost-gt_cost) / gt_cost
-    # print(f'Ground truth cost: {gt_cost:.3f}')
-    # print(f'Predicted cost: {solved_cost:.3f} (Gap: {100*(solved_cost-gt_cost) / gt_cost:.4f}%)')
-    
-    ########################## Prediction ##########################
-    # plt.imshow(img_pred, cmap='gray')
-    # plt.show()
-    
-    pil = Image.fromarray(((img_pred+1) * 127).astype(np.uint8), 'L')
-    pil = pil.resize((256, 256))
-    pil.save(f'./Result/Image/Img_pred_{nnn}_{gap:.4f}.png')
-    ########################## Prediction ##########################
-    
-    results.append((solved_cost, gt_cost, gap, ns, points, gt_tour, solved_tour))
-    
-result_df = pd.DataFrame({
-    'solved_cost' : [x[0] for x in results],
-    'gt_cost' : [x[1] for x in results],
-    'gap(%)' : [x[2] for x in results],
-    'ns' : [x[3] for x in results],
-    'gt_tour' : [x[5] for x in results],
-    'solved_tour' : [x[6] for x in results],
-})
-result_df.to_csv('./Result/result.csv', index=False)
+    if nnn%save_freq==0:
+        result_df = pd.DataFrame({
+        'sample_idx' : sample_idxes,
+        'gt_cost' : gt_costs,
+        'basic_cost' : basic_costs,
+        'penalty_count' : penalty_counts,
+        })
+        result_df.to_csv(f'{output_path}/from{args.start_idx}_to{args.end_idx}.csv', index=False)
+else:
+    result_df = pd.DataFrame({
+    'sample_idx' : sample_idxes,
+    'gt_cost' : gt_costs,
+    'basic_cost' : basic_costs,
+    'penalty_count' : penalty_counts,
+    })
+    result_df.to_csv(f'{output_path}/from{args.start_idx}_to{args.end_idx}.csv', index=False)
